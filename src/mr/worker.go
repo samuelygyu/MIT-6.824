@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 const IntermediateDir = "/home/youyg/go/intermediate"
@@ -55,9 +56,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		case Done:
 			os.Exit(1)
 		default:
-			// panic!
-			log.Println("wrong task type!!!")
-			return
+			// log.Println("wrong task type!!!")
+			time.Sleep(time.Millisecond * 100)
+			continue	
 		}
 	}
 	// uncomment to send the Example RPC to the coordinator.
@@ -69,21 +70,18 @@ func executeMapTask(mapf func(string, string) []KeyValue, reply GetTaskReply) {
 	kva := mapf(reply.Filename, getContentByFilename(reply.Filename))
 
 	m := make(map[int][]KeyValue)
+	for i := 0; i < reply.NReduceTasks; i++ {
+		m[i] = []KeyValue{}
+	}
 
 	for _, kv := range kva {
 		keyh := ihash(kv.Key) % reply.NReduceTasks
-
-		v, ok := m[keyh]
-		if !ok {
-			m[keyh] = []KeyValue{}
-		}
-		v = append(v, kv)
-		m[keyh] = v
+		m[keyh] = append(m[keyh], kv)
 	}
 
-	file, _ := os.Create("log.out")
-	defer file.Close()
-	fmt.Fprint(file, m)
+	// file, _ := os.Create("log.out")
+	// defer file.Close()
+	// fmt.Fprint(file, m)
 	// err := os.MkdirAll(IntermediateDir, 0755)
 	// if err != nil {
 	// 	log.Printf("can't create the dir [%v] cause: %v", IntermediateDir, err)
@@ -102,7 +100,7 @@ func executeMapTask(mapf func(string, string) []KeyValue, reply GetTaskReply) {
 			file, err := os.Create(fmt.Sprintf("mr-%v-%v", reply.TaskNum, k))
 
 			if err != nil {
-				log.Println(err)
+				log.Fatal(err)
 			}
 			defer file.Close()
 			enc := json.NewEncoder(file)

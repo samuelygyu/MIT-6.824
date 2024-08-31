@@ -70,6 +70,7 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 		}
 		if c.reduceTasksIssued[i].After(time.Now()) {
 			reduceDoneFlag = false
+			continue
 		}
 
 		reply.NMapTasks = len(c.mapFiles)
@@ -83,6 +84,7 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	if reduceDoneFlag {
 		c.isDone = true
 		reply.TaskType = Done
+		log.Println("The all task has done")
 	}
 	return nil
 }
@@ -131,7 +133,10 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.isDone
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	done := c.isDone
+	return done
 }
 
 // create a Coordinator.
