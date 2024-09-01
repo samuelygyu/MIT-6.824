@@ -58,7 +58,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		default:
 			// log.Println("wrong task type!!!")
 			time.Sleep(time.Millisecond * 100)
-			continue	
+			continue
 		}
 	}
 	// uncomment to send the Example RPC to the coordinator.
@@ -78,18 +78,6 @@ func executeMapTask(mapf func(string, string) []KeyValue, reply GetTaskReply) {
 		keyh := ihash(kv.Key) % reply.NReduceTasks
 		m[keyh] = append(m[keyh], kv)
 	}
-
-	// file, _ := os.Create("log.out")
-	// defer file.Close()
-	// fmt.Fprint(file, m)
-	// err := os.MkdirAll(IntermediateDir, 0755)
-	// if err != nil {
-	// 	log.Printf("can't create the dir [%v] cause: %v", IntermediateDir, err)
-	// }
-	// err = os.Chdir(IntermediateDir)
-	// if err != nil {
-	// 	log.Println(err)
-	// }
 
 	// Create a channel to wait thread to complete it's task
 	c := make(chan int, 10)
@@ -137,8 +125,11 @@ func executeReduceTask(reducef func(string, []string) string, reply GetTaskReply
 
 	sort.Sort(ByKey(intermediate))
 
-	oname := fmt.Sprintf("mr-out-%v", reply.TaskNum)
-	ofile, _ := os.Create(oname)
+	ofile, err := os.CreateTemp("./", "mr-out-temp-*")
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	//
 	// call Reduce on each distinct key in intermediate[],
@@ -163,6 +154,13 @@ func executeReduceTask(reducef func(string, []string) string, reply GetTaskReply
 	}
 
 	ofile.Close()
+
+	// Rename output Atomically
+	err = os.Rename(ofile.Name(), fmt.Sprintf("mr-out-%v", reply.TaskNum))
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	// send done msg to coordinator
 	args := FinishedTaskArgs{}

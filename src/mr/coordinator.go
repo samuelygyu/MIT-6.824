@@ -84,7 +84,7 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	if reduceDoneFlag {
 		c.isDone = true
 		reply.TaskType = Done
-		log.Println("The all task has done")
+		// log.Println("The all task has done")
 	}
 	return nil
 }
