@@ -9,7 +9,6 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"time"
 )
 
 const IntermediateDir = "/home/youyg/go/intermediate"
@@ -56,8 +55,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		case Done:
 			os.Exit(1)
 		default:
-			// log.Println("wrong task type!!!")
-			time.Sleep(time.Millisecond * 100)
+			log.Println("wrong task type!!!")
 			continue
 		}
 	}

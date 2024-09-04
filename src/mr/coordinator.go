@@ -12,11 +12,10 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	mu sync.Mutex
+	mu   sync.Mutex
+	cond sync.Cond
 
 	mapFiles []string
-	// The count of map task which have done
-	nMapTasks int
 	// The total number of the reduce task
 	nReduceTasks int
 
@@ -44,48 +43,60 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	defer c.mu.Unlock()
 
 	// Assign the map task
-	for i, f := range c.mapFiles {
-		// Skip the finished task and processing task
-		if c.mapTasksFinished[i] || c.mapTasksIssued[i].After(time.Now()) {
-			continue
+	for {
+		mapDoneFlag := true
+		for i, done := range c.mapTasksFinished {
+			if !done {
+				// log.Println(c.mapTasksIssued)
+				if c.mapTasksIssued[i].IsZero() || time.Since(c.mapTasksIssued[i]).Seconds() > 10 {
+					reply.Filename = c.mapFiles[i]
+					reply.NReduceTasks = c.nReduceTasks
+					reply.TaskNum = i
+					reply.TaskType = Map
+					c.mapTasksIssued[i] = time.Now()
+					return nil
+				} else {
+					mapDoneFlag = false
+				}
+			}
 		}
 
-		reply.Filename = f
-		reply.NReduceTasks = c.nReduceTasks
-		reply.TaskNum = i
-		reply.TaskType = Map
-		c.mapTasksIssued[i] = time.Now().Add(time.Second * 10)
-		return nil
-	}
-	if c.nMapTasks < len(c.mapFiles) {
-		return nil
-	}
-
-	// Assign the reduce task
-	reduceDoneFlag := true
-	for i := 0; i < c.nReduceTasks; i++ {
-		// Skip the finished task and processing task
-		if c.reduceTasksFinished[i] {
-			continue
+		if !mapDoneFlag {
+			c.cond.Wait()
+		} else {
+			break
 		}
-		if c.reduceTasksIssued[i].After(time.Now()) {
-			reduceDoneFlag = false
-			continue
+	}
+
+	// Assign the reduce task loop
+	for {
+		reduceDoneFlag := true
+		for i, done := range c.reduceTasksFinished {
+			if !done {
+				// if true task	unprocess or timeout 
+				if c.reduceTasksIssued[i].IsZero() || time.Since(c.reduceTasksIssued[i]).Seconds() > 10 {
+					reply.NMapTasks = len(c.mapFiles)
+					reply.NReduceTasks = c.nReduceTasks
+					reply.TaskNum = i
+					reply.TaskType = Reduce
+					c.reduceTasksIssued[i] = time.Now()
+					return nil
+				} else {
+					reduceDoneFlag = false
+				}
+			}
+		}
+		
+		if !reduceDoneFlag {
+			c.cond.Wait()
+		} else {
+			break
 		}
 
-		reply.NMapTasks = len(c.mapFiles)
-		reply.NReduceTasks = c.nReduceTasks
-		reply.TaskNum = i
-		reply.TaskType = Reduce
-		c.reduceTasksIssued[i] = time.Now().Add(time.Second * 10)
-		return nil
 	}
 
-	if reduceDoneFlag {
-		c.isDone = true
-		reply.TaskType = Done
-		// log.Println("The all task has done")
-	}
+	c.isDone = true
+	reply.TaskType = Done
 	return nil
 }
 
@@ -93,6 +104,7 @@ func (c *Coordinator) HandleFinishedTask(args *FinishedTaskArgs, reply *Finished
 	// log.Printf("[TASK:	%v] finished", args.TaskNum)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer c.cond.Broadcast()
 
 	switch args.TaskType {
 	case Map:
@@ -101,7 +113,6 @@ func (c *Coordinator) HandleFinishedTask(args *FinishedTaskArgs, reply *Finished
 		}
 
 		c.mapTasksFinished[args.TaskNum] = true
-		c.nMapTasks++
 		return nil
 	case Reduce:
 		if c.reduceTasksFinished[args.TaskNum] {
@@ -146,12 +157,24 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	c.mu = sync.Mutex{}
+	c.cond = *sync.NewCond(&c.mu)
 	c.mapFiles = files
 	c.nReduceTasks = nReduce
 	c.mapTasksFinished = make([]bool, len(files))
 	c.mapTasksIssued = make([]time.Time, len(files))
 	c.reduceTasksFinished = make([]bool, nReduce)
 	c.reduceTasksIssued = make([]time.Time, nReduce)
+
+	// Regular wait up the getHandler
+	go func() {
+		for {
+			c.mu.Lock()
+			c.cond.Broadcast()
+			c.mu.Unlock()
+			time.Sleep(time.Second)
+		}
+	}()
+
 	c.server()
 	return &c
 }
