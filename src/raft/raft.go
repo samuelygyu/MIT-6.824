@@ -19,7 +19,6 @@ package raft
 
 import (
 	//	"bytes"
-	"fmt"
 	"math"
 	"math/rand"
 	"sync"
@@ -89,10 +88,6 @@ type Raft struct {
 type Entry struct {
 	Term    int
 	Command interface{} //TODO not sure
-}
-
-func (rf *Raft) String() string {
-	return fmt.Sprintf("peers size: %v|currentTerm: %v|votedFor: %v|state: %v|electionTime: %v|me: %v", len(rf.peers), rf.currentTerm, rf.votedFor, rf.state, rf.electionTime, rf.me)
 }
 
 type AppendEntries struct {
@@ -232,6 +227,7 @@ type RequestAppendEntriesReply struct {
 
 // Heartbeat RPC handler
 func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	DPrintf("%v, RPC called HandleAppendEntries Start---", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -244,6 +240,7 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 
 	// handle case which is the leader
 	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
 	rf.resetRaft()
 	rf.electionTime = time.Now()
 
@@ -256,27 +253,30 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 		rf.log = rf.log[:args.PrevLogIndex+1]
 		rf.log = append(rf.log, args.Entries...)
 	}
-	rf.checkTheCommitAndSend(args.LeaderCommit)
+	rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
+	go rf.sendCommitedMsg()
 	reply.Success = true
-
+	DPrintf("[%v]HandleAppendEntries End---log:%v", rf.me, rf.log)
 }
 
-// refresh the commitIndex, send the apply msg if needed
-func (rf *Raft) checkTheCommitAndSend(leaderCommit int) {
-	rf.commitIndex = int(math.Min(float64(leaderCommit), float64(len(rf.log))))
+// send the commited msg to the status machine
+// !!! using channel, if call between lock, better call this function in goroutine
+func (rf *Raft) sendCommitedMsg() {
 	// commit command
 	for {
+		rf.mu.Lock()
 		if rf.commitIndex <= rf.lastApplied {
+			rf.mu.Unlock()
 			break
 		}
 		rf.lastApplied++
-		go func(commitIndex int, command interface{}, lastApplied int) {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      command,
-				CommandIndex: lastApplied,
-			}
-		}(rf.commitIndex, rf.log[rf.lastApplied].Command, rf.lastApplied)
+		lastApplied := rf.lastApplied
+		rf.mu.Unlock()
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[lastApplied].Command,
+			CommandIndex: lastApplied,
+		}
 	}
 }
 
@@ -381,13 +381,14 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		// 傻逼，leader执行完一次appendEnties后再次获取锁失败，死锁！！！
 		rf.mu.Lock()
 		if rf.state == Leader {
+			DPrintf("[%v] I am the leader %v---------------", rf.me, rf.log)
 			rf.appendEntries()
 		} else {
 			// Time out
-			if time.Since(rf.electionTime).Milliseconds() > 500 {
+			if time.Since(rf.electionTime).Milliseconds() > 700 {
+				DPrintf("[%v]Start election, currentTerm:%v", rf.me, rf.currentTerm)
 				rf.currentTerm++
 				rf.votedFor = rf.me
 				rf.state = Candidate
@@ -395,28 +396,27 @@ func (rf *Raft) ticker() {
 				rf.electionTime = time.Now()
 			}
 		}
-		ms := 50 + (rand.Int63() % 300)
 		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(time.Duration(50+(rand.Int63()%300)) * time.Millisecond)
 	}
 }
 
 func (rf *Raft) appendEntries() {
-	for i, peer := range rf.peers {
-		if i == rf.me {
+	for index, peer := range rf.peers {
+		if index == rf.me {
 			continue
 		}
+		// Retry to success
+		// 2 case shutdown the loop
+		// 1. currentTerm!= args.Term
+		// 2. return success, that mean follower's log is consistent with leader's log
 		go func(index int, peer *labrpc.ClientEnd) {
-			reply := RequestAppendEntriesReply{}
-			// Retry to success
-			// 2 case shutdown the loop
-			// 1. currentTerm!= args.Term
-			// 2. return success, that mean follower's log is consistent with leader's log
 			for {
 				rf.mu.Lock()
+				DPrintf("hello")
 				args := RequestAppendEntriesArgs{
 					Term:         rf.currentTerm,
 					PrevLogIndex: rf.nextIndex[index] - 1,
@@ -424,10 +424,11 @@ func (rf *Raft) appendEntries() {
 					Entries:      rf.log[rf.nextIndex[index]:],
 					LeaderCommit: rf.commitIndex,
 				}
+				reply := RequestAppendEntriesReply{}
 				logLen := len(rf.log)
 				rf.mu.Unlock()
-				ok := peer.Call("Raft.HandleAppendEntries", &args, &reply)
-				if ok {
+				if peer.Call("Raft.HandleAppendEntries", &args, &reply) {
+					DPrintf("RPC HandleAppendEntries Success, peer:%v, args:%v, reply:%v", index, args, reply)
 					rf.mu.Lock()
 					if !reply.Success {
 						if rf.currentTerm != reply.Term {
@@ -436,7 +437,7 @@ func (rf *Raft) appendEntries() {
 							rf.mu.Unlock()
 							break
 						} else {
-							rf.nextIndex[index] -= rf.nextIndex[index]
+							rf.nextIndex[index] -= 1
 							rf.mu.Unlock()
 						}
 					} else {
@@ -446,12 +447,18 @@ func (rf *Raft) appendEntries() {
 						rf.mu.Unlock()
 						break
 					}
+				} else {
+					DPrintf("RPC HandleAppendEntries Fail, peer:%v, args:%v, reply:%v", index, args, reply)
+					break
+					// checkout if the requeset is fail, should be retry?
+					// do not retry for now
 				}
-				//TODO checkout if the requeset is fail, should be retry?
 			}
-		}(i, peer)
+		}(index, peer)
 	}
+
 	//TODO caculate the commitIndex
+	// 上面rpc是异步的，有可能执行commitIndex更新时，rpc没执行完全，导致replication数量不够，没能及时向状态机发送指令
 	for {
 		count := 1
 		isMostReplicate := false
@@ -464,16 +471,6 @@ func (rf *Raft) appendEntries() {
 			}
 			if count > len(rf.peers)/2 {
 				rf.commitIndex += 1
-				go func(commitIndex int) {
-					rf.applyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      rf.log[commitIndex].Command,
-						CommandIndex: rf.commitIndex,
-					}
-					rf.mu.Lock()
-					rf.lastApplied = rf.commitIndex
-					rf.mu.Unlock()
-				}(rf.commitIndex)
 				isMostReplicate = true
 				break
 			}
@@ -481,6 +478,33 @@ func (rf *Raft) appendEntries() {
 		if !isMostReplicate {
 			break
 		}
+	}
+
+	// send reply msg
+	go rf.sendCommitedMsg()
+}
+
+func (rf *Raft) HeartbeatEntries(peerIndex int) {
+	DPrintf("Heartbeat peer:%v", peerIndex)
+	rf.mu.Lock()
+	args := RequestAppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := RequestAppendEntriesReply{}
+	peer := rf.peers[peerIndex]
+	rf.mu.Unlock()
+	if peer.Call("Raft.HandleAppendEntries", &args, &reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if !reply.Success {
+			if rf.currentTerm != reply.Term {
+				rf.resetRaft()
+				rf.currentTerm = reply.Term
+			}
+		}
+	} else {
+		DPrintf("RPC Heartbeat Fail, peer:%v", peerIndex)
 	}
 }
 
@@ -501,7 +525,12 @@ func (rf *Raft) startElection(currentTerm int) {
 		}
 		go func(peer int) {
 			reply := RequestVoteReply{}
-			if rf.sendRequestVote(peer, &args, &reply) {
+			ok := rf.sendRequestVote(peer, &args, &reply)
+			// if rf.sendRequestVote(peer, &args, &reply) {
+			rf.mu.Lock()
+			DPrintf("[%v] start election currentTerm:%v, args:%v, reply:%v", rf.me, currentTerm, args, reply)
+			rf.mu.Unlock()
+			if ok {
 				rf.mu.Lock()
 				if rf.currentTerm == args.Term && rf.state == Candidate {
 					if reply.VoteGranted {
