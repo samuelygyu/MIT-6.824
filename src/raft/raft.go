@@ -88,6 +88,7 @@ type Raft struct {
 type Entry struct {
 	Term    int
 	Command interface{} //TODO not sure
+	Index 	int
 }
 
 type AppendEntries struct {
@@ -227,7 +228,7 @@ type RequestAppendEntriesReply struct {
 
 // Heartbeat RPC handler
 func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	DPrintf("%v, RPC called HandleAppendEntries Start---", rf.me)
+	DPrintf("[%v]RPC:Callee HandleAppendEntries Start---", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -236,6 +237,17 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
+	}
+
+	// if the leader's log it's not the newest, return false
+	argsLogLen := len(args.Entries)
+	if argsLogLen != 0 {
+		argsLastLog := args.Entries[len(args.Entries)-1]
+		rfLastLog := rf.log[len(rf.log)-1]
+		if argsLastLog.Term < rfLastLog.Term || (argsLastLog.Term == rfLastLog.Term && argsLastLog.Index < rfLastLog.Index) {
+			reply.Success = false			
+			return
+		}
 	}
 
 	// handle case which is the leader
@@ -249,14 +261,14 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 		return
 	}
 	// if len(args.Entres) == 0, the follower's log is identical with the leader's log
-	if len(args.Entries) != 0 {
+	if argsLogLen != 0 {
 		rf.log = rf.log[:args.PrevLogIndex+1]
 		rf.log = append(rf.log, args.Entries...)
 	}
 	rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
 	go rf.sendCommitedMsg()
 	reply.Success = true
-	DPrintf("[%v]HandleAppendEntries End---log:%v", rf.me, rf.log)
+	DPrintf("[%v]RPC:Callee HandleAppendEntries End---log:%v", rf.me, rf.log)
 }
 
 // send the commited msg to the status machine
@@ -347,8 +359,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		index = len(rf.log) - 1
 		term = rf.currentTerm
+		go func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			rf.appendEntries()
+		}()
 	}
-
 	return index, term, isLeader
 }
 
@@ -392,7 +408,7 @@ func (rf *Raft) ticker() {
 				rf.currentTerm++
 				rf.votedFor = rf.me
 				rf.state = Candidate
-				rf.startElection(rf.currentTerm)
+				go rf.startElection(rf.currentTerm)
 				rf.electionTime = time.Now()
 			}
 		}
@@ -416,7 +432,6 @@ func (rf *Raft) appendEntries() {
 		go func(index int, peer *labrpc.ClientEnd) {
 			for {
 				rf.mu.Lock()
-				DPrintf("hello")
 				args := RequestAppendEntriesArgs{
 					Term:         rf.currentTerm,
 					PrevLogIndex: rf.nextIndex[index] - 1,
@@ -428,15 +443,25 @@ func (rf *Raft) appendEntries() {
 				logLen := len(rf.log)
 				rf.mu.Unlock()
 				if peer.Call("Raft.HandleAppendEntries", &args, &reply) {
-					DPrintf("RPC HandleAppendEntries Success, peer:%v, args:%v, reply:%v", index, args, reply)
+					DPrintf("[%v]RPC:Caller HandleAppendEntries Success, peer:%v, args:%v, reply:%v", rf.me, index, args, reply)
 					rf.mu.Lock()
+					// there is three case that reply.Success is false
+					// 1. follower's term > currentTerm
+					// 2. follower's log is newer than the leader's log
+					// 3. the leader's nextIndex didn't match
 					if !reply.Success {
-						if rf.currentTerm != reply.Term {
+						if reply.Term == 0 {
+							// case 2
+							rf.mu.Unlock()
+							break	
+						} else if rf.currentTerm != reply.Term {
+							// case 1
 							rf.resetRaft()
 							rf.currentTerm = reply.Term
 							rf.mu.Unlock()
 							break
 						} else {
+							// case 3
 							rf.nextIndex[index] -= 1
 							rf.mu.Unlock()
 						}
@@ -448,7 +473,7 @@ func (rf *Raft) appendEntries() {
 						break
 					}
 				} else {
-					DPrintf("RPC HandleAppendEntries Fail, peer:%v, args:%v, reply:%v", index, args, reply)
+					DPrintf("[%v]RPC:Caller HandleAppendEntries Fail, peer:%v", rf.me, index)
 					break
 					// checkout if the requeset is fail, should be retry?
 					// do not retry for now
@@ -457,8 +482,9 @@ func (rf *Raft) appendEntries() {
 		}(index, peer)
 	}
 
-	//TODO caculate the commitIndex
+	// caculate the commitIndex
 	// 上面rpc是异步的，有可能执行commitIndex更新时，rpc没执行完全，导致replication数量不够，没能及时向状态机发送指令
+	//TODO the index of the log could be commit depend on the current log'term is similar to the leader's currentTerm
 	for {
 		count := 1
 		isMostReplicate := false
@@ -509,6 +535,7 @@ func (rf *Raft) HeartbeatEntries(peerIndex int) {
 }
 
 func (rf *Raft) startElection(currentTerm int) {
+	rf.mu.Lock()
 	voteGrantedCount := 1
 	routeId := rand.Int() % 500
 	args := RequestVoteArgs{
@@ -519,11 +546,15 @@ func (rf *Raft) startElection(currentTerm int) {
 		RouteId:      routeId,
 	}
 
+	var wg sync.WaitGroup
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
+		wg.Add(1)
 		go func(peer int) {
+			defer wg.Done()
+
 			reply := RequestVoteReply{}
 			ok := rf.sendRequestVote(peer, &args, &reply)
 			// if rf.sendRequestVote(peer, &args, &reply) {
@@ -560,6 +591,15 @@ func (rf *Raft) startElection(currentTerm int) {
 				rf.mu.Unlock()
 			}
 		}(peer)
+	}
+	rf.mu.Unlock()
+
+	// wait for all the goroutine finish, if the cadidator compete was failed, reset the raft
+	wg.Wait()
+	if (voteGrantedCount <= len(rf.peers)/2) {
+		rf.mu.Lock()
+		rf.resetRaft()
+		rf.mu.Unlock()
 	}
 }
 
