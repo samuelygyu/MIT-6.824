@@ -60,7 +60,8 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	condition sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -88,7 +89,7 @@ type Raft struct {
 type Entry struct {
 	Term    int
 	Command interface{} //TODO not sure
-	Index 	int
+	Index   int
 }
 
 type AppendEntries struct {
@@ -245,7 +246,7 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 		argsLastLog := args.Entries[len(args.Entries)-1]
 		rfLastLog := rf.log[len(rf.log)-1]
 		if argsLastLog.Term < rfLastLog.Term || (argsLastLog.Term == rfLastLog.Term && argsLastLog.Index < rfLastLog.Index) {
-			reply.Success = false			
+			reply.Success = false
 			return
 		}
 	}
@@ -266,30 +267,9 @@ func (rf *Raft) HandleAppendEntries(args *RequestAppendEntriesArgs, reply *Reque
 		rf.log = append(rf.log, args.Entries...)
 	}
 	rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
-	go rf.sendCommitedMsg()
+	rf.signalL()
 	reply.Success = true
 	DPrintf("[%v]RPC:Callee HandleAppendEntries End---log:%v", rf.me, rf.log)
-}
-
-// send the commited msg to the status machine
-// !!! using channel, if call between lock, better call this function in goroutine
-func (rf *Raft) sendCommitedMsg() {
-	// commit command
-	for {
-		rf.mu.Lock()
-		if rf.commitIndex <= rf.lastApplied {
-			rf.mu.Unlock()
-			break
-		}
-		rf.lastApplied++
-		lastApplied := rf.lastApplied
-		rf.mu.Unlock()
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[lastApplied].Command,
-			CommandIndex: lastApplied,
-		}
-	}
 }
 
 func now() int64 {
@@ -420,6 +400,27 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for !rf.killed() {
+		if rf.lastApplied < rf.commitIndex && rf.lastApplied < len(rf.log){
+			rf.lastApplied++
+			msg := ApplyMsg {
+				CommandValid: true,
+				Command: rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+		} else {
+			rf.condition.Wait()
+		}
+	}	
+}
+
 func (rf *Raft) appendEntries() {
 	for index, peer := range rf.peers {
 		if index == rf.me {
@@ -453,7 +454,7 @@ func (rf *Raft) appendEntries() {
 						if reply.Term == 0 {
 							// case 2
 							rf.mu.Unlock()
-							break	
+							break
 						} else if rf.currentTerm != reply.Term {
 							// case 1
 							rf.resetRaft()
@@ -484,30 +485,32 @@ func (rf *Raft) appendEntries() {
 
 	// caculate the commitIndex
 	// 上面rpc是异步的，有可能执行commitIndex更新时，rpc没执行完全，导致replication数量不够，没能及时向状态机发送指令
-	//TODO the index of the log could be commit depend on the current log'term is similar to the leader's currentTerm
-	for {
-		count := 1
-		isMostReplicate := false
-		for i, matchIndex := range rf.matchIndex {
-			if i == rf.me {
+	// the index of the log could be commit depend on the current log'term is similar to the leader's currentTerm
+	start := rf.commitIndex + 1
+	for i := start; i < len(rf.log); i++ {
+		if rf.log[i].Term != rf.currentTerm {
+			continue
+		}
+		n := 1
+		for j := 0; j < len(rf.peers); j++ {
+			if j == rf.me {
 				continue
 			}
-			if matchIndex > rf.commitIndex {
-				count++
+			if rf.matchIndex[j] >= start {
+				n++
 			}
-			if count > len(rf.peers)/2 {
-				rf.commitIndex += 1
-				isMostReplicate = true
-				break
+			if n > len(rf.peers)/2 {
+				rf.commitIndex = i
 			}
-		}
-		if !isMostReplicate {
-			break
 		}
 	}
 
-	// send reply msg
-	go rf.sendCommitedMsg()
+	// wait-up the applymsg thread
+	rf.signalL()
+}
+
+func (rf *Raft) signalL() {
+	rf.condition.Broadcast()
 }
 
 func (rf *Raft) HeartbeatEntries(peerIndex int) {
@@ -596,7 +599,7 @@ func (rf *Raft) startElection(currentTerm int) {
 
 	// wait for all the goroutine finish, if the cadidator compete was failed, reset the raft
 	wg.Wait()
-	if (voteGrantedCount <= len(rf.peers)/2) {
+	if voteGrantedCount <= len(rf.peers)/2 {
 		rf.mu.Lock()
 		rf.resetRaft()
 		rf.mu.Unlock()
@@ -626,6 +629,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.condition = *sync.NewCond(&rf.mu)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.resetRaft()
@@ -642,6 +646,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
 }
